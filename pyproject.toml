@@ -1,0 +1,46 @@
+[project]
+name = "aimlib"
+version = "0.4.2"
+description = "Python SDK for aimlib mobile proxies and remote-browser sessions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "aimlib" }]
+keywords = ["aimlib", "mobile-proxy", "proxy", "remote-browser", "asyncio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["httpx>=0.27,<1"]
+
+# A browser driver is only needed for device.browser(); the proxy surface works without it.
+# Patchright connects to the existing managed browser, so no local browser binary is installed.
+# Keep this exact pin: browser-driver changes affect both compatibility and page-visible signals.
+[project.optional-dependencies]
+browser = ["patchright==1.61.2"]
+
+[project.urls]
+Documentation = "https://docs.aimlib.com/"
+Changelog = "https://github.com/rukouai/aimlib-python/blob/main/CHANGELOG.md"
+Issues = "https://github.com/rukouai/aimlib-python/issues"
+Source = "https://github.com/rukouai/aimlib-python"
+
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aimlib*"]

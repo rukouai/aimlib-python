@@ -3,6 +3,13 @@
 Customer-visible SDK and API changes are documented here. PyPI releases are immutable; fixes are
 published as a new version.
 
+## 0.4.3 - 2026-07-14
+
+- Fixed managed-browser footprint selection so each selected profile presents its own reported
+  device model, screen size, and device pixel ratio.
+- Added strict identity validation so a selected footprint cannot silently fall back to a different
+  visible profile.
+
 ## 0.4.2 - 2026-07-14
 
 - Published `aimlib` through PyPI for the first time.

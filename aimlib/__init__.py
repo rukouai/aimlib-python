@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import math
 import os
 import re
 from typing import Optional
@@ -195,8 +196,11 @@ def _with_google_chrome_brand(rows: list[dict[str, str]], *, label: str) -> list
     return branded
 
 
-def _google_chrome_user_agent_override(identity: object) -> Optional[dict]:
-    """Build a coherent ChromePublic -> Google Chrome UA-CH override from native phone values."""
+def _google_chrome_user_agent_override(
+    identity: object,
+    model_override: Optional[str] = None,
+) -> Optional[dict]:
+    """Build coherent Google Chrome UA-CH metadata, optionally with a selected model."""
     if not isinstance(identity, dict):
         raise BrowserPolicyError("managed browser identity metadata is unavailable")
     user_agent = identity.get("userAgent")
@@ -217,6 +221,10 @@ def _google_chrome_user_agent_override(identity: object) -> Optional[dict]:
         raise BrowserPolicyError("managed browser did not present a mobile Android user agent")
     if ua_platform != "Android" or identity.get("mobile") is not True:
         raise BrowserPolicyError("managed browser did not present Android client hints")
+    if model_override is not None and (
+        not isinstance(model_override, str) or not 1 <= len(model_override) <= 128
+    ):
+        raise BrowserPolicyError("managed browser footprint model is invalid")
 
     brands = _validated_ua_brand_rows(identity.get("brands"), label="brand")
     full_versions = _validated_ua_brand_rows(
@@ -227,7 +235,8 @@ def _google_chrome_user_agent_override(identity: object) -> Optional[dict]:
     full_has_google = any(row["brand"] == "Google Chrome" for row in full_versions)
     if low_has_google != full_has_google:
         raise BrowserPolicyError("managed browser Chrome brand metadata is inconsistent")
-    if low_has_google:
+    effective_model = model_override if model_override is not None else identity["model"]
+    if low_has_google and effective_model == identity["model"]:
         return None
 
     return {
@@ -242,11 +251,81 @@ def _google_chrome_user_agent_override(identity: object) -> Optional[dict]:
             "platform": ua_platform,
             "platformVersion": identity["platformVersion"],
             "architecture": identity["architecture"],
-            "model": identity["model"],
+            "model": effective_model,
             "mobile": True,
             "bitness": identity["bitness"],
             "wow64": identity.get("wow64") is True,
         },
+    }
+
+
+def _validated_footprint_identity(value: object, applied_footprint: str) -> Optional[dict]:
+    """Validate the public, browser-observable identity for an applied footprint."""
+    if not applied_footprint:
+        return None
+    if not isinstance(applied_footprint, str) or len(applied_footprint) > 128:
+        raise BrowserPolicyError("managed browser footprint identifier is invalid")
+    if not isinstance(value, dict) or value.get("name") != applied_footprint:
+        raise BrowserPolicyError("managed browser footprint identity is unavailable")
+    model = value.get("model")
+    width = value.get("screen_width")
+    height = value.get("screen_height")
+    ratio = value.get("device_pixel_ratio")
+    if not isinstance(model, str) or not 1 <= len(model) <= 128:
+        raise BrowserPolicyError("managed browser footprint model is invalid")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or not 320 <= width <= 10_000
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or not 320 <= height <= 10_000
+    ):
+        raise BrowserPolicyError("managed browser footprint display is invalid")
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(float(ratio))
+        or not 0.5 <= float(ratio) <= 10
+    ):
+        raise BrowserPolicyError("managed browser footprint pixel ratio is invalid")
+    return {
+        "name": applied_footprint,
+        "model": model,
+        "screen_width": width,
+        "screen_height": height,
+        "device_pixel_ratio": float(ratio),
+    }
+
+
+def _device_metrics_override(identity: Optional[dict]) -> Optional[dict]:
+    """Convert physical display pixels into the target's portrait CSS viewport."""
+    if identity is None:
+        return None
+    ratio = identity["device_pixel_ratio"]
+    css_width = math.ceil(identity["screen_width"] / ratio)
+    css_height = math.ceil(identity["screen_height"] / ratio)
+    return {
+        "width": css_width,
+        "height": css_height,
+        "deviceScaleFactor": ratio,
+        "mobile": True,
+        "screenWidth": css_width,
+        "screenHeight": css_height,
+        "positionX": 0,
+        "positionY": 0,
+        "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+    }
+
+
+def _identity_verification(identity: Optional[dict], metrics: Optional[dict]) -> Optional[dict]:
+    if identity is None or metrics is None:
+        return None
+    return {
+        "model": identity["model"],
+        "screenWidth": metrics["screenWidth"],
+        "screenHeight": metrics["screenHeight"],
+        "devicePixelRatio": metrics["deviceScaleFactor"],
     }
 
 
@@ -280,20 +359,25 @@ _READ_NATIVE_BROWSER_IDENTITY = r"""async () => {
 }"""
 
 
-_VERIFY_GOOGLE_CHROME_BRAND = r"""async () => {
+_VERIFY_MANAGED_BROWSER_IDENTITY = r"""async expected => {
   const data = navigator.userAgentData;
   // UA-CH is unavailable on Chrome's internal startup page. That is not an override failure:
   // the same target exposes the metadata after its first secure navigation.
   if (!data || !Array.isArray(data.brands)) return null;
   let high = {};
   try {
-    high = await data.getHighEntropyValues(['fullVersionList']);
+    high = await data.getHighEntropyValues(['fullVersionList', 'model']);
   } catch (_) {
     return null;
   }
   if (!Array.isArray(high.fullVersionList)) return null;
-  return data.brands.some(row => row.brand === 'Google Chrome') &&
+  const branded = data.brands.some(row => row.brand === 'Google Chrome') &&
     high.fullVersionList.some(row => row.brand === 'Google Chrome');
+  if (!branded || !expected) return branded;
+  return high.model === expected.model &&
+    screen.width === expected.screenWidth &&
+    screen.height === expected.screenHeight &&
+    Math.abs(devicePixelRatio - expected.devicePixelRatio) < 0.001;
 }"""
 
 
@@ -308,6 +392,7 @@ class Proxy:
         # Kept for older callers. The endpoint itself auto-detects both protocols.
         self.protocol = d.get("protocol")
         self.status = d.get("status")
+        self.status_detail = d.get("status_detail")
         parsed = urlsplit(self.url or "")
         self.host = parsed.hostname
         self.port = parsed.port
@@ -484,7 +569,7 @@ class BrowserSession:
         self.max_tabs = int(data.get("max_tabs") or 5)  # per-session tab cap (server-configured)
         self._gave_initial = False
         self.egress_ip = None
-        self.fingerprint = {}
+        self.fingerprint = data.get("resolved_profile") or {}
         self.desired_footprint = data.get("desired_footprint") or ""
         self.applied_footprint = data.get("applied_footprint") or ""
         self.expires_at = data.get("expires_at")
@@ -515,6 +600,7 @@ class BrowserSession:
             # Do not connect until a requested browser footprint is fully active.
             footprint_ok = (not self.desired_footprint) or (self.applied_footprint == self.desired_footprint)
             if self.status in ("ready", "active", "idle") and footprint_ok:
+                _validated_footprint_identity(self.fingerprint, self.applied_footprint)
                 return
             if self.status in ("expiring", "gone"):
                 raise SessionExpiredError(f"session {self.status}")
@@ -610,9 +696,15 @@ class BrowserSession:
             r = await self._ai._http.get(f"/v1/devices/{self.device.id}/browser")
             if r.status_code == 404:
                 raise SessionExpiredError("session not found / expired")
+            _raise_for_typed(r)
             data = r.json()
+            if data.get("session_id") != self.id:
+                raise SessionExpiredError("session was replaced by a newer browser session")
+            self.status = data.get("status")
             self.applied_footprint = data.get("applied_footprint") or ""
-            if self.applied_footprint == fp and data.get("status") in ("ready", "active", "idle"):
+            self.fingerprint = data.get("resolved_profile") or {}
+            if self.applied_footprint == fp and self.status in ("ready", "active", "idle"):
+                _validated_footprint_identity(self.fingerprint, self.applied_footprint)
                 await self.connect(timeout=timeout)  # transparent reconnect to the same session_id
                 return
             await asyncio.sleep(2)
@@ -639,23 +731,37 @@ class BrowserSession:
         self._gave_initial = False
 
     async def _apply_page_identity(self, page):
-        """Brand ChromePublic coherently without changing the phone's native version or model."""
+        """Apply the managed browser identity consistently."""
         page_key = id(page)
         if page_key in self._identity_pages:
             return
         cdp_session = None
         try:
-            identity = await self._native_identity_for_page(page)
-            override = _google_chrome_user_agent_override(identity)
-            if override is not None:
+            footprint_identity = _validated_footprint_identity(
+                self.fingerprint,
+                self.applied_footprint,
+            )
+            identity = await self._native_identity_for_page(page, footprint_identity)
+            override = _google_chrome_user_agent_override(
+                identity,
+                footprint_identity["model"] if footprint_identity else None,
+            )
+            metrics = _device_metrics_override(footprint_identity)
+            if override is not None or metrics is not None:
                 cdp_session = await page.context.new_cdp_session(page)
-                await cdp_session.send("Emulation.setUserAgentOverride", override)
-                verified = await page.evaluate(_VERIFY_GOOGLE_CHROME_BRAND)
+                if override is not None:
+                    await cdp_session.send("Emulation.setUserAgentOverride", override)
+                if metrics is not None:
+                    await cdp_session.send("Emulation.setDeviceMetricsOverride", metrics)
+                verified = await page.evaluate(
+                    _VERIFY_MANAGED_BROWSER_IDENTITY,
+                    _identity_verification(footprint_identity, metrics),
+                )
                 # Internal/about:blank startup pages cannot expose UA-CH. The override has already
                 # been validated on the secure bootstrap tab below; a definitive false result on a
                 # page that does expose UA-CH still fails closed.
                 if verified is False:
-                    raise BrowserPolicyError("managed browser Chrome branding did not apply")
+                    raise BrowserPolicyError("managed browser identity did not apply")
                 self._identity_cdp_sessions.append(cdp_session)
                 cdp_session = None
             self._identity_pages.add(page_key)
@@ -670,7 +776,7 @@ class BrowserSession:
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _native_identity_for_page(self, page):
+    async def _native_identity_for_page(self, page, footprint_identity: Optional[dict] = None):
         """Read UA-CH in a secure first-party context when Chrome's startup tab cannot expose it."""
         if self._native_browser_identity is not None:
             return self._native_browser_identity
@@ -686,21 +792,32 @@ class BrowserSession:
                     timeout=30_000,
                 )
                 identity = await bootstrap_page.evaluate(_READ_NATIVE_BROWSER_IDENTITY)
-                override = _google_chrome_user_agent_override(identity)
-                if override is not None:
+                override = _google_chrome_user_agent_override(
+                    identity,
+                    footprint_identity["model"] if footprint_identity else None,
+                )
+                metrics = _device_metrics_override(footprint_identity)
+                if override is not None or metrics is not None:
                     bootstrap_cdp_session = await page.context.new_cdp_session(
                         bootstrap_page
                     )
-                    await bootstrap_cdp_session.send(
-                        "Emulation.setUserAgentOverride",
-                        override,
-                    )
+                    if override is not None:
+                        await bootstrap_cdp_session.send(
+                            "Emulation.setUserAgentOverride",
+                            override,
+                        )
+                    if metrics is not None:
+                        await bootstrap_cdp_session.send(
+                            "Emulation.setDeviceMetricsOverride",
+                            metrics,
+                        )
                     verified = await bootstrap_page.evaluate(
-                        _VERIFY_GOOGLE_CHROME_BRAND
+                        _VERIFY_MANAGED_BROWSER_IDENTITY,
+                        _identity_verification(footprint_identity, metrics),
                     )
                     if verified is not True:
                         raise BrowserPolicyError(
-                            "managed browser Chrome branding did not apply"
+                            "managed browser identity did not apply"
                         )
             except Exception as exc:  # noqa: BLE001 - keep URL/session details out of the error
                 if isinstance(exc, BrowserPolicyError):

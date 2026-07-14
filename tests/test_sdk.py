@@ -18,9 +18,11 @@ from aimlib import (
     _Operations,
     _apply_browser_driver_policy,
     _async_playwright,
+    _device_metrics_override,
     _google_chrome_user_agent_override,
     _raise_for_typed,
     _ttl_seconds,
+    _validated_footprint_identity,
 )
 
 
@@ -208,6 +210,50 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
 
         self.assertIsNone(_google_chrome_user_agent_override(identity))
 
+    def test_rewrites_model_even_when_google_chrome_is_already_branded(self):
+        identity = self.chromium_identity()
+        identity["brands"].append({"brand": "Google Chrome", "version": "151"})
+        identity["fullVersionList"].append(
+            {"brand": "Google Chrome", "version": "151.0.7883.0"}
+        )
+
+        override = _google_chrome_user_agent_override(identity, "Pixel 6 Pro")
+
+        self.assertEqual(override["userAgentMetadata"]["model"], "Pixel 6 Pro")
+        self.assertEqual(override["userAgent"], identity["userAgent"])
+
+    def test_validates_public_identity_and_builds_pixel_6_pro_metrics(self):
+        profile = _validated_footprint_identity(
+            {
+                "name": "pixel-6-pro",
+                "model": "Pixel 6 Pro",
+                "screen_width": 1440,
+                "screen_height": 3120,
+                "device_pixel_ratio": 3.5,
+            },
+            "pixel-6-pro",
+        )
+
+        self.assertEqual(
+            _device_metrics_override(profile),
+            {
+                "width": 412,
+                "height": 892,
+                "deviceScaleFactor": 3.5,
+                "mobile": True,
+                "screenWidth": 412,
+                "screenHeight": 892,
+                "positionX": 0,
+                "positionY": 0,
+                "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+            },
+        )
+
+    def test_rejects_missing_or_mismatched_selected_identity(self):
+        for profile in ({}, {"name": "pixel-6a"}):
+            with self.subTest(profile=profile), self.assertRaises(BrowserPolicyError):
+                _validated_footprint_identity(profile, "pixel-6-pro")
+
     def test_fails_closed_on_inconsistent_or_non_android_metadata(self):
         inconsistent = self.chromium_identity()
         inconsistent["brands"].append({"brand": "Google Chrome", "version": "151"})
@@ -276,7 +322,7 @@ class BrowserIdentityApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(
             BrowserPolicyError,
-            "managed browser Chrome branding did not apply",
+            "managed browser identity did not apply",
         ):
             await session._apply_page_identity(startup_page)
 
@@ -327,6 +373,60 @@ class BrowserIdentityApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         page.context.new_cdp_session.assert_not_awaited()
 
+    async def test_applies_selected_model_and_display_metrics_to_the_target(self):
+        session = session_for(MagicMock())
+        session.applied_footprint = "pixel-6-pro"
+        session.fingerprint = {
+            "name": "pixel-6-pro",
+            "model": "Pixel 6 Pro",
+            "screen_width": 1440,
+            "screen_height": 3120,
+            "device_pixel_ratio": 3.5,
+        }
+        page = MagicMock()
+        page.evaluate = AsyncMock(
+            side_effect=(BrowserIdentityPolicyTests.chromium_identity(), True)
+        )
+        cdp_session = MagicMock()
+        cdp_session.send = AsyncMock()
+        cdp_session.detach = AsyncMock()
+        page.context.new_cdp_session = AsyncMock(return_value=cdp_session)
+
+        await session._apply_page_identity(page)
+
+        self.assertEqual(cdp_session.send.await_count, 2)
+        ua_call, metrics_call = cdp_session.send.await_args_list
+        self.assertEqual(ua_call.args[0], "Emulation.setUserAgentOverride")
+        self.assertEqual(
+            ua_call.args[1]["userAgentMetadata"]["model"],
+            "Pixel 6 Pro",
+        )
+        self.assertEqual(metrics_call.args[0], "Emulation.setDeviceMetricsOverride")
+        self.assertEqual(
+            metrics_call.args[1],
+            {
+                "width": 412,
+                "height": 892,
+                "deviceScaleFactor": 3.5,
+                "mobile": True,
+                "screenWidth": 412,
+                "screenHeight": 892,
+                "positionX": 0,
+                "positionY": 0,
+                "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+            },
+        )
+        _, expected = page.evaluate.await_args.args
+        self.assertEqual(
+            expected,
+            {
+                "model": "Pixel 6 Pro",
+                "screenWidth": 412,
+                "screenHeight": 892,
+                "devicePixelRatio": 3.5,
+            },
+        )
+
 
 class ModelTests(unittest.TestCase):
     def test_device_and_proxy_mapping(self):
@@ -368,12 +468,14 @@ class ModelTests(unittest.TestCase):
                 "url": "socks5h://customer:secret@example.test:43117",
                 "protocol": "socks5",
                 "status": "active",
+                "status_detail": "ready",
             }
         )
         self.assertEqual(proxy.http_url, "http://customer:secret@example.test:43117")
         self.assertEqual(proxy.socks5_url, "socks5://customer:secret@example.test:43117")
         self.assertEqual(proxy.socks5h_url, "socks5h://customer:secret@example.test:43117")
         self.assertEqual(proxy.protocols, ("http", "socks5"))
+        self.assertEqual(proxy.status_detail, "ready")
         self.assertEqual(proxy.host, "example.test")
         self.assertEqual(proxy.port, 43117)
         self.assertNotIn("customer", repr(proxy))
@@ -466,6 +568,56 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(SessionExpiredError, "replaced"):
             await session.wait_until_ready(timeout=1)
+
+    async def test_ready_fails_closed_when_selected_identity_is_missing(self):
+        http = MagicMock()
+        http.get = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "session_id": "session-1",
+                    "status": "ready",
+                    "desired_footprint": "pixel-6-pro",
+                    "applied_footprint": "pixel-6-pro",
+                    "resolved_profile": {"name": "pixel-6-pro"},
+                },
+            )
+        )
+        session = session_for(http)
+        session.desired_footprint = "pixel-6-pro"
+
+        with self.assertRaisesRegex(BrowserPolicyError, "footprint model is invalid"):
+            await session.wait_until_ready(timeout=1)
+
+    async def test_set_footprint_refreshes_identity_before_reconnect(self):
+        http = MagicMock()
+        http.post = AsyncMock(return_value=response(200, {"status": "accepted"}, "POST"))
+        profile = {
+            "name": "pixel-6-pro",
+            "model": "Pixel 6 Pro",
+            "screen_width": 1440,
+            "screen_height": 3120,
+            "device_pixel_ratio": 3.5,
+        }
+        http.get = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "session_id": "session-1",
+                    "status": "ready",
+                    "applied_footprint": "pixel-6-pro",
+                    "resolved_profile": profile,
+                },
+            )
+        )
+        session = session_for(http)
+        session._disconnect = AsyncMock()
+        session.connect = AsyncMock()
+
+        await session.set_footprint("pixel-6-pro", timeout=1)
+
+        self.assertEqual(session.fingerprint, profile)
+        session.connect.assert_awaited_once_with(timeout=1)
 
     async def test_connect_retries_and_stops_failed_playwright_instance(self):
         http = MagicMock()

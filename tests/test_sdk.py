@@ -451,8 +451,9 @@ class ModelTests(unittest.TestCase):
             object(),
             {
                 "device_id": "dev-1",
-                "region": "uswest1",
+                "region": "uswest",
                 "carrier": "att",
+                "carriers": ["att", "tmobile"],
                 "proxy": {
                     "id": "proxy-1",
                     "url": "socks5h://example.test:1234",
@@ -462,6 +463,7 @@ class ModelTests(unittest.TestCase):
             },
         )
         self.assertEqual(device.id, "dev-1")
+        self.assertEqual(device.carriers, ["att", "tmobile"])
         self.assertEqual(device.proxy.id, "proxy-1")
         self.assertEqual(device.proxy.protocol, "socks5")
 
@@ -477,6 +479,10 @@ class ModelTests(unittest.TestCase):
         self.assertFalse(device.browser_available)
         self.assertEqual(device.lease_id, "lease-1")
         self.assertEqual(device.lease_ends_at, "2026-07-13T01:00:00Z")
+
+    def test_device_defaults_carrier_inventory_for_older_servers(self):
+        device = Device(object(), {"device_id": "dev-1"})
+        self.assertEqual(device.carriers, [])
 
     def test_proxy_exposes_both_protocols_without_leaking_credentials_in_repr(self):
         proxy = Proxy(
@@ -497,6 +503,38 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(proxy.port, 43117)
         self.assertNotIn("customer", repr(proxy))
         self.assertNotIn("secret", repr(proxy))
+
+
+class DeviceCarrierTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_carrier_returns_preflight_result_without_mutating_device(self):
+        http = MagicMock()
+        http.post = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "status": "failed",
+                    "type": "carrier_switch",
+                    "error": "carrier_unavailable",
+                    "carrier": "att",
+                    "available_carriers": ["tmobile"],
+                },
+                "POST",
+                "/v1/devices/dev-1/carrier",
+            )
+        )
+        ai = MagicMock()
+        ai._http = http
+        device = Device(ai, {"device_id": "dev-1", "carrier": "tmobile", "carriers": ["tmobile"]})
+
+        result = await device.switch_carrier("att")
+
+        self.assertEqual(result["error"], "carrier_unavailable")
+        self.assertEqual(device.carrier, "tmobile")
+        http.post.assert_awaited_once_with(
+            "/v1/devices/dev-1/carrier",
+            json={"carrier": "att", "wait": True, "timeout_s": 200},
+            timeout=230,
+        )
 
 
 class OperationTests(unittest.IsolatedAsyncioTestCase):

@@ -422,6 +422,7 @@ class Device:
         self.id = d["device_id"]
         self.region = d.get("region")
         self.carrier = d.get("carrier")
+        self.carriers = list(d.get("carriers") or [])
         self.current_egress_ip = d.get("current_egress_ip")
         self.proxy = Proxy(d["proxy"]) if d.get("proxy") else None
         browser = d.get("browser") or {}
@@ -502,8 +503,9 @@ class Device:
     async def switch_carrier(self, carrier: str, wait: bool = True, timeout: float = 200) -> dict:
         """Switch to an available carrier identifier.
 
-        Accepted identifiers are ``tmobile``, ``att``, and ``verizon``; availability is
-        device-specific. Blocking mode returns a terminal operation dictionary. With
+        Accepted identifiers are ``tmobile``, ``att``, and ``verizon``; check ``device.carriers``
+        for this device's provisioned choices. Blocking mode returns a terminal operation
+        dictionary. With
         ``wait=False``, poll the returned ``operation_id`` through ``ai.operations``.
         """
         body = {"carrier": carrier, "wait": wait, "timeout_s": int(timeout)}
@@ -1012,7 +1014,7 @@ class Aimlib:
         if not self.api_key:
             raise AimlibError("no API key (pass api_key= or set AIMLIB_API_KEY)")
         # Use the regional customer API URL assigned to the account unless explicitly overridden.
-        self.base_url = (base_url or os.environ.get("AIMLIB_BASE_URL", "https://uswest1.aimlib.com")).rstrip("/")
+        self.base_url = (base_url or os.environ.get("AIMLIB_BASE_URL", "https://uswest.aimlib.com")).rstrip("/")
         self._http = httpx.AsyncClient(
             base_url=self.base_url, timeout=timeout,
             headers={"Authorization": f"Bearer {self.api_key}"},

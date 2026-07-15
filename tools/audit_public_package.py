@@ -121,7 +121,7 @@ ALLOWED_HOSTS = {
     "github.com",
     "img.shields.io",
     "pypi.org",
-    "uswest1.aimlib.com",
+    "uswest.aimlib.com",
 }
 ALLOWED_TEST_NETWORKS = tuple(
     ipaddress.ip_network(cidr)

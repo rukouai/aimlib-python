@@ -255,6 +255,32 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
             _VERIFY_MANAGED_BROWSER_IDENTITY,
         )
 
+    def test_footprint_verification_allows_one_sided_density_rounding(self):
+        profile = _validated_footprint_identity(
+            {
+                "name": "pixel-9-pro-xl",
+                "model": "Pixel 9 Pro XL",
+                "screen_width": 1344,
+                "screen_height": 2992,
+                "device_pixel_ratio": 3.5,
+            },
+            "pixel-9-pro-xl",
+        )
+
+        self.assertEqual(
+            _expected_device_metrics(profile),
+            {
+                "screenWidth": 384,
+                "screenHeight": 855,
+                "devicePixelRatio": 3.5,
+            },
+        )
+        self.assertIn("screen.width >= expected.screenWidth", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.width <= expected.screenWidth + 1", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.height >= expected.screenHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.height <= expected.screenHeight + 1", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertNotIn("screen.width === expected.screenWidth", _VERIFY_MANAGED_BROWSER_IDENTITY)
+
     def test_rejects_missing_or_mismatched_selected_identity(self):
         for profile in ({}, {"name": "pixel-6a"}):
             with self.subTest(profile=profile), self.assertRaises(BrowserPolicyError):

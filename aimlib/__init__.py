@@ -373,9 +373,14 @@ _VERIFY_MANAGED_BROWSER_IDENTITY = r"""async expected => {
   const headfulInsets = screen.availHeight < screen.height &&
     innerHeight < screen.availHeight &&
     visualViewport && visualViewport.height > 0 && visualViewport.height <= innerHeight + 1;
+  // Android's integer density quantization can expose one CSS pixel above the physical-pixel / DPR
+  // ceiling. Permit only that one-sided delta; larger or smaller display identities still fail.
+  const screenMetrics = screen.width >= expected.screenWidth &&
+    screen.width <= expected.screenWidth + 1 &&
+    screen.height >= expected.screenHeight &&
+    screen.height <= expected.screenHeight + 1;
   return high.model === expected.model &&
-    screen.width === expected.screenWidth &&
-    screen.height === expected.screenHeight &&
+    screenMetrics &&
     Math.abs(devicePixelRatio - expected.devicePixelRatio) < 0.001 &&
     headfulInsets;
 }"""

@@ -297,34 +297,29 @@ def _validated_footprint_identity(value: object, applied_footprint: str) -> Opti
     }
 
 
-def _device_metrics_override(identity: Optional[dict]) -> Optional[dict]:
-    """Convert physical display pixels into the target's portrait CSS viewport."""
+def _expected_device_metrics(identity: Optional[dict]) -> Optional[dict]:
+    """Convert the OS-applied physical display into expected portrait CSS metrics."""
     if identity is None:
         return None
     ratio = identity["device_pixel_ratio"]
     css_width = math.ceil(identity["screen_width"] / ratio)
     css_height = math.ceil(identity["screen_height"] / ratio)
     return {
-        "width": css_width,
-        "height": css_height,
-        "deviceScaleFactor": ratio,
-        "mobile": True,
         "screenWidth": css_width,
         "screenHeight": css_height,
-        "positionX": 0,
-        "positionY": 0,
-        "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+        "devicePixelRatio": ratio,
     }
 
 
-def _identity_verification(identity: Optional[dict], metrics: Optional[dict]) -> Optional[dict]:
+def _identity_verification(identity: Optional[dict]) -> Optional[dict]:
+    metrics = _expected_device_metrics(identity)
     if identity is None or metrics is None:
         return None
     return {
         "model": identity["model"],
         "screenWidth": metrics["screenWidth"],
         "screenHeight": metrics["screenHeight"],
-        "devicePixelRatio": metrics["deviceScaleFactor"],
+        "devicePixelRatio": metrics["devicePixelRatio"],
     }
 
 
@@ -373,10 +368,14 @@ _VERIFY_MANAGED_BROWSER_IDENTITY = r"""async expected => {
   const branded = data.brands.some(row => row.brand === 'Google Chrome') &&
     high.fullVersionList.some(row => row.brand === 'Google Chrome');
   if (!branded || !expected) return branded;
+  const headfulInsets = screen.availHeight < screen.height &&
+    innerHeight < screen.availHeight &&
+    visualViewport && visualViewport.height > 0 && visualViewport.height <= innerHeight;
   return high.model === expected.model &&
     screen.width === expected.screenWidth &&
     screen.height === expected.screenHeight &&
-    Math.abs(devicePixelRatio - expected.devicePixelRatio) < 0.001;
+    Math.abs(devicePixelRatio - expected.devicePixelRatio) < 0.001 &&
+    headfulInsets;
 }"""
 
 
@@ -746,24 +745,23 @@ class BrowserSession:
                 identity,
                 footprint_identity["model"] if footprint_identity else None,
             )
-            metrics = _device_metrics_override(footprint_identity)
-            if override is not None or metrics is not None:
+            expected = _identity_verification(footprint_identity)
+            if override is not None:
                 cdp_session = await page.context.new_cdp_session(page)
-                if override is not None:
-                    await cdp_session.send("Emulation.setUserAgentOverride", override)
-                if metrics is not None:
-                    await cdp_session.send("Emulation.setDeviceMetricsOverride", metrics)
+                await cdp_session.send("Emulation.setUserAgentOverride", override)
+            if override is not None or expected is not None:
                 verified = await page.evaluate(
                     _VERIFY_MANAGED_BROWSER_IDENTITY,
-                    _identity_verification(footprint_identity, metrics),
+                    expected,
                 )
                 # Internal/about:blank startup pages cannot expose UA-CH. The override has already
                 # been validated on the secure bootstrap tab below; a definitive false result on a
                 # page that does expose UA-CH still fails closed.
                 if verified is False:
                     raise BrowserPolicyError("managed browser identity did not apply")
-                self._identity_cdp_sessions.append(cdp_session)
-                cdp_session = None
+                if cdp_session is not None:
+                    self._identity_cdp_sessions.append(cdp_session)
+                    cdp_session = None
             self._identity_pages.add(page_key)
         except BrowserPolicyError:
             raise
@@ -796,24 +794,19 @@ class BrowserSession:
                     identity,
                     footprint_identity["model"] if footprint_identity else None,
                 )
-                metrics = _device_metrics_override(footprint_identity)
-                if override is not None or metrics is not None:
+                expected = _identity_verification(footprint_identity)
+                if override is not None:
                     bootstrap_cdp_session = await page.context.new_cdp_session(
                         bootstrap_page
                     )
-                    if override is not None:
-                        await bootstrap_cdp_session.send(
-                            "Emulation.setUserAgentOverride",
-                            override,
-                        )
-                    if metrics is not None:
-                        await bootstrap_cdp_session.send(
-                            "Emulation.setDeviceMetricsOverride",
-                            metrics,
-                        )
+                    await bootstrap_cdp_session.send(
+                        "Emulation.setUserAgentOverride",
+                        override,
+                    )
+                if override is not None or expected is not None:
                     verified = await bootstrap_page.evaluate(
                         _VERIFY_MANAGED_BROWSER_IDENTITY,
-                        _identity_verification(footprint_identity, metrics),
+                        expected,
                     )
                     if verified is not True:
                         raise BrowserPolicyError(

@@ -18,11 +18,12 @@ from aimlib import (
     _Operations,
     _apply_browser_driver_policy,
     _async_playwright,
-    _device_metrics_override,
+    _expected_device_metrics,
     _google_chrome_user_agent_override,
     _raise_for_typed,
     _ttl_seconds,
     _validated_footprint_identity,
+    _VERIFY_MANAGED_BROWSER_IDENTITY,
 )
 
 
@@ -222,7 +223,7 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
         self.assertEqual(override["userAgentMetadata"]["model"], "Pixel 6 Pro")
         self.assertEqual(override["userAgent"], identity["userAgent"])
 
-    def test_validates_public_identity_and_builds_pixel_6_pro_metrics(self):
+    def test_validates_public_identity_and_builds_pixel_6_pro_expectations(self):
         profile = _validated_footprint_identity(
             {
                 "name": "pixel-6-pro",
@@ -235,19 +236,18 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            _device_metrics_override(profile),
+            _expected_device_metrics(profile),
             {
-                "width": 412,
-                "height": 892,
-                "deviceScaleFactor": 3.5,
-                "mobile": True,
                 "screenWidth": 412,
                 "screenHeight": 892,
-                "positionX": 0,
-                "positionY": 0,
-                "screenOrientation": {"type": "portraitPrimary", "angle": 0},
+                "devicePixelRatio": 3.5,
             },
         )
+
+    def test_footprint_verification_requires_headful_browser_insets(self):
+        self.assertIn("screen.availHeight < screen.height", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("innerHeight < screen.availHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("visualViewport.height <= innerHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
 
     def test_rejects_missing_or_mismatched_selected_identity(self):
         for profile in ({}, {"name": "pixel-6a"}):
@@ -373,7 +373,7 @@ class BrowserIdentityApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         page.context.new_cdp_session.assert_not_awaited()
 
-    async def test_applies_selected_model_and_display_metrics_to_the_target(self):
+    async def test_applies_selected_model_and_validates_os_display_metrics(self):
         session = session_for(MagicMock())
         session.applied_footprint = "pixel-6-pro"
         session.fingerprint = {
@@ -394,27 +394,12 @@ class BrowserIdentityApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         await session._apply_page_identity(page)
 
-        self.assertEqual(cdp_session.send.await_count, 2)
-        ua_call, metrics_call = cdp_session.send.await_args_list
+        self.assertEqual(cdp_session.send.await_count, 1)
+        ua_call = cdp_session.send.await_args
         self.assertEqual(ua_call.args[0], "Emulation.setUserAgentOverride")
         self.assertEqual(
             ua_call.args[1]["userAgentMetadata"]["model"],
             "Pixel 6 Pro",
-        )
-        self.assertEqual(metrics_call.args[0], "Emulation.setDeviceMetricsOverride")
-        self.assertEqual(
-            metrics_call.args[1],
-            {
-                "width": 412,
-                "height": 892,
-                "deviceScaleFactor": 3.5,
-                "mobile": True,
-                "screenWidth": 412,
-                "screenHeight": 892,
-                "positionX": 0,
-                "positionY": 0,
-                "screenOrientation": {"type": "portraitPrimary", "angle": 0},
-            },
         )
         _, expected = page.evaluate.await_args.args
         self.assertEqual(

@@ -249,6 +249,12 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
         self.assertIn("innerHeight < screen.availHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
         self.assertIn("visualViewport.height <= innerHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
 
+    def test_footprint_verification_allows_subpixel_viewport_rounding(self):
+        self.assertIn(
+            "visualViewport.height <= innerHeight + 1",
+            _VERIFY_MANAGED_BROWSER_IDENTITY,
+        )
+
     def test_rejects_missing_or_mismatched_selected_identity(self):
         for profile in ({}, {"name": "pixel-6a"}):
             with self.subTest(profile=profile), self.assertRaises(BrowserPolicyError):

@@ -368,9 +368,11 @@ _VERIFY_MANAGED_BROWSER_IDENTITY = r"""async expected => {
   const branded = data.brands.some(row => row.brand === 'Google Chrome') &&
     high.fullVersionList.some(row => row.brand === 'Google Chrome');
   if (!branded || !expected) return branded;
+  // visualViewport.height retains subpixel precision while innerHeight is integer-rounded.
+  // Allow only that bounded rounding delta; a collapsed/full-screen viewport remains far outside it.
   const headfulInsets = screen.availHeight < screen.height &&
     innerHeight < screen.availHeight &&
-    visualViewport && visualViewport.height > 0 && visualViewport.height <= innerHeight;
+    visualViewport && visualViewport.height > 0 && visualViewport.height <= innerHeight + 1;
   return high.model === expected.model &&
     screen.width === expected.screenWidth &&
     screen.height === expected.screenHeight &&

@@ -2,7 +2,6 @@
 
 [![PyPI](https://img.shields.io/pypi/v/aimlib)](https://pypi.org/project/aimlib/)
 [![Python](https://img.shields.io/pypi/pyversions/aimlib)](https://pypi.org/project/aimlib/)
-[![CI](https://github.com/rukouai/aimlib-python/actions/workflows/ci.yml/badge.svg)](https://github.com/rukouai/aimlib-python/actions/workflows/ci.yml)
 
 Asynchronous Python client for aimlib mobile proxies, managed remote-browser sessions, network
 operations, and support tickets. Python 3.10 or newer is required.

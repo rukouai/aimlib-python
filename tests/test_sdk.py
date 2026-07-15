@@ -5,16 +5,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from aimlib import (
+    AccountInactiveError,
     AimlibError,
+    AuthenticationError,
     BrowserPolicyError,
     BrowserSession,
     BrowserUnavailableError,
-    DataCapError,
     Device,
+    FootprintNotCleanError,
+    Operation,
+    OperationFailedError,
     OperationTimeout,
     Proxy,
+    RateLimitError,
     SessionExpiredError,
     SessionTimeout,
+    _HTTPClient,
     _Operations,
     _apply_browser_driver_policy,
     _async_playwright,
@@ -76,14 +82,35 @@ class ErrorMappingTests(unittest.TestCase):
     def response(status, payload):
         return response(status, payload)
 
-    def test_typed_error(self):
-        with self.assertRaisesRegex(DataCapError, "monthly cap"):
-            _raise_for_typed(
-                self.response(
-                    409,
-                    {"error": "data_cap_exceeded", "message": "monthly cap reached"},
-                )
-            )
+    def test_authentication_error_is_typed_and_carries_request_metadata(self):
+        r = self.response(
+            401,
+            {"error": "unauthorized", "message": "key revoked", "request_id": "req-1"},
+        )
+        with self.assertRaisesRegex(AuthenticationError, "key revoked") as caught:
+            _raise_for_typed(r)
+        self.assertEqual(caught.exception.code, "unauthorized")
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.request_id, "req-1")
+
+    def test_rate_limit_attaches_retry_after(self):
+        r = httpx.Response(
+            429,
+            json={"error": "rate_limited", "message": "slow down"},
+            headers={"Retry-After": "7"},
+            request=httpx.Request("GET", "https://example.test/v1/devices"),
+        )
+        with self.assertRaises(RateLimitError) as caught:
+            _raise_for_typed(r)
+        self.assertEqual(caught.exception.retry_after, 7)
+
+    def test_inactive_account_is_distinct_from_inactive_lease(self):
+        with self.assertRaises(AccountInactiveError):
+            _raise_for_typed(self.response(403, {"error": "account_inactive"}))
+
+    def test_footprint_error_points_to_catalog(self):
+        with self.assertRaisesRegex(FootprintNotCleanError, "list_footprints"):
+            _raise_for_typed(self.response(400, {"error": "footprint_not_clean"}))
 
     def test_browser_unavailable_error(self):
         for code in ("browser_unavailable", "device_unavailable"):
@@ -255,6 +282,32 @@ class BrowserIdentityPolicyTests(unittest.TestCase):
             _VERIFY_MANAGED_BROWSER_IDENTITY,
         )
 
+    def test_footprint_verification_allows_one_sided_density_rounding(self):
+        profile = _validated_footprint_identity(
+            {
+                "name": "pixel-9-pro-xl",
+                "model": "Pixel 9 Pro XL",
+                "screen_width": 1344,
+                "screen_height": 2992,
+                "device_pixel_ratio": 3.5,
+            },
+            "pixel-9-pro-xl",
+        )
+
+        self.assertEqual(
+            _expected_device_metrics(profile),
+            {
+                "screenWidth": 384,
+                "screenHeight": 855,
+                "devicePixelRatio": 3.5,
+            },
+        )
+        self.assertIn("screen.width >= expected.screenWidth", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.width <= expected.screenWidth + 1", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.height >= expected.screenHeight", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertIn("screen.height <= expected.screenHeight + 1", _VERIFY_MANAGED_BROWSER_IDENTITY)
+        self.assertNotIn("screen.width === expected.screenWidth", _VERIFY_MANAGED_BROWSER_IDENTITY)
+
     def test_rejects_missing_or_mismatched_selected_identity(self):
         for profile in ({}, {"name": "pixel-6a"}):
             with self.subTest(profile=profile), self.assertRaises(BrowserPolicyError):
@@ -425,8 +478,9 @@ class ModelTests(unittest.TestCase):
             object(),
             {
                 "device_id": "dev-1",
-                "region": "uswest1",
+                "region": "uswest",
                 "carrier": "att",
+                "carriers": ["att", "tmobile"],
                 "proxy": {
                     "id": "proxy-1",
                     "url": "socks5h://example.test:1234",
@@ -436,8 +490,10 @@ class ModelTests(unittest.TestCase):
             },
         )
         self.assertEqual(device.id, "dev-1")
+        self.assertEqual(device.carriers, ["att", "tmobile"])
         self.assertEqual(device.proxy.id, "proxy-1")
-        self.assertEqual(device.proxy.protocol, "socks5")
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(device.proxy.protocol, "socks5")
 
     def test_device_exposes_browser_and_lease_metadata(self):
         device = Device(
@@ -445,12 +501,23 @@ class ModelTests(unittest.TestCase):
             {
                 "device_id": "dev-1",
                 "browser": {"available": False},
-                "lease": {"id": "lease-1", "ends_at": "2026-07-13T01:00:00Z"},
+                "lease": {
+                    "id": "lease-1",
+                    "starts_at": "2026-07-12T01:00:00Z",
+                    "ends_at": None,
+                    "open_ended": True,
+                },
             },
         )
         self.assertFalse(device.browser_available)
         self.assertEqual(device.lease_id, "lease-1")
-        self.assertEqual(device.lease_ends_at, "2026-07-13T01:00:00Z")
+        self.assertEqual(device.lease_starts_at, "2026-07-12T01:00:00Z")
+        self.assertIsNone(device.lease_ends_at)
+        self.assertTrue(device.lease_open_ended)
+
+    def test_device_defaults_carrier_inventory_for_older_servers(self):
+        device = Device(object(), {"device_id": "dev-1"})
+        self.assertEqual(device.carriers, [])
 
     def test_proxy_exposes_both_protocols_without_leaking_credentials_in_repr(self):
         proxy = Proxy(
@@ -471,6 +538,109 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(proxy.port, 43117)
         self.assertNotIn("customer", repr(proxy))
         self.assertNotIn("secret", repr(proxy))
+        self.assertEqual(
+            proxy.as_httpx(),
+            {"proxy": "http://customer:secret@example.test:43117"},
+        )
+        self.assertEqual(
+            proxy.as_requests("socks5h"),
+            {
+                "proxies": {
+                    "http": "socks5h://customer:secret@example.test:43117",
+                    "https": "socks5h://customer:secret@example.test:43117",
+                }
+            },
+        )
+
+
+class DeviceCarrierTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_carrier_raises_typed_failure_without_mutating_device(self):
+        http = MagicMock()
+        http.post = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "status": "failed",
+                    "type": "carrier_switch",
+                    "error": "carrier_unavailable",
+                    "carrier": "att",
+                    "available_carriers": ["tmobile"],
+                },
+                "POST",
+                "/v1/devices/dev-1/carrier",
+            )
+        )
+        ai = MagicMock()
+        ai._http = http
+        device = Device(ai, {"device_id": "dev-1", "carrier": "tmobile", "carriers": ["tmobile"]})
+
+        with self.assertRaises(OperationFailedError) as caught:
+            await device.switch_carrier("att")
+
+        self.assertEqual(caught.exception.operation["error"], "carrier_unavailable")
+        self.assertEqual(device.carrier, "tmobile")
+        http.post.assert_awaited_once_with(
+            "/v1/devices/dev-1/carrier",
+            json={"carrier": "att", "wait": True, "timeout_s": 200},
+            timeout=230,
+            headers={},
+        )
+
+
+class DeviceQOLTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_uses_direct_lookup_and_updates_in_place(self):
+        http = MagicMock()
+        http.get = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "device_id": "dev-1",
+                    "region": "uswest",
+                    "carrier": "att",
+                    "lease": {"id": "lease-1", "open_ended": True},
+                },
+                path="/v1/devices/dev-1",
+            )
+        )
+        ai = MagicMock()
+        ai._http = http
+        device = Device(ai, {"device_id": "dev-1", "carrier": "tmobile"})
+
+        refreshed = await device.refresh()
+
+        self.assertIs(refreshed, device)
+        self.assertEqual(device.carrier, "att")
+        self.assertTrue(device.lease_open_ended)
+        http.get.assert_awaited_once_with("/v1/devices/dev-1")
+
+    async def test_whoami_refreshes_egress_identity(self):
+        http = MagicMock()
+        http.get = AsyncMock(
+            return_value=response(
+                200,
+                {"egress_ip": "203.0.113.22", "carrier": "verizon"},
+                path="/v1/devices/dev-1/whoami",
+            )
+        )
+        ai = MagicMock()
+        ai._http = http
+        device = Device(ai, {"device_id": "dev-1"})
+
+        self.assertEqual(await device.egress_ip(), "203.0.113.22")
+        self.assertEqual(device.carrier, "verizon")
+
+    async def test_device_list_passes_server_side_filters(self):
+        http = MagicMock()
+        http.get = AsyncMock(return_value=response(200, []))
+        from aimlib import _Devices
+
+        devices = _Devices(SimpleNamespace(_http=http))
+        await devices.list(region="uswest", carrier="att", browser=True)
+
+        http.get.assert_awaited_once_with(
+            "/v1/devices",
+            params={"region": "uswest", "carrier": "att", "browser": True},
+        )
 
 
 class OperationTests(unittest.IsolatedAsyncioTestCase):
@@ -492,6 +662,9 @@ class OperationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await operations.get("op-1")
 
+        self.assertIsInstance(result, Operation)
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.id, "op-1")
         self.assertEqual(result["new_ip"], "203.0.113.8")
         http.get.assert_awaited_once_with("/v1/operations/op-1")
 
@@ -521,6 +694,93 @@ class OperationTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(OperationTimeout, "polling timed out"):
             await operations.wait("op-1", timeout=0)
+
+    async def test_wait_raises_terminal_failure_with_result(self):
+        http = MagicMock()
+        http.get = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "operation_id": "op-1",
+                    "status": "failed",
+                    "error": "carrier_unavailable",
+                    "message": "carrier is not provisioned on this device",
+                },
+            )
+        )
+        operations = _Operations(SimpleNamespace(_http=http))
+
+        with self.assertRaises(OperationFailedError) as caught:
+            await operations.wait("op-1")
+
+        self.assertEqual(caught.exception.operation.id, "op-1")
+        self.assertEqual(caught.exception.code, "carrier_unavailable")
+
+    async def test_blocking_rotate_raises_terminal_timeout_with_result(self):
+        http = MagicMock()
+        http.post = AsyncMock(
+            return_value=response(
+                200,
+                {
+                    "operation_id": "op-1",
+                    "type": "ip_rotation",
+                    "status": "timeout",
+                    "error": "operation_timeout",
+                },
+                "POST",
+            )
+        )
+        ai = MagicMock()
+        ai._http = http
+        device = Device(ai, {"device_id": "dev-1"})
+
+        with self.assertRaises(OperationTimeout) as caught:
+            await device.rotate_ip(timeout="4m")
+
+        self.assertEqual(caught.exception.operation.id, "op-1")
+
+
+class HTTPClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idempotent_get_retries_502(self):
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return httpx.Response(502, json={"error": "upstream"})
+            return httpx.Response(200, json={"ok": True})
+
+        client = _HTTPClient(base_url="https://example.test", api_key="test-key", timeout=5)
+        client._client = httpx.AsyncClient(
+            base_url="https://example.test",
+            transport=httpx.MockTransport(handler),
+        )
+        with patch("aimlib.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await client.get("/v1/devices")
+        await client.aclose()
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(calls, 3)
+        self.assertEqual(sleep.await_count, 2)
+
+    async def test_mutating_post_gets_one_server_idempotency_key(self):
+        captured = []
+
+        async def handler(request):
+            captured.append(request.headers.get("Idempotency-Key"))
+            return httpx.Response(201, json={"ok": True})
+
+        client = _HTTPClient(base_url="https://example.test", api_key="test-key", timeout=5)
+        client._client = httpx.AsyncClient(
+            base_url="https://example.test",
+            transport=httpx.MockTransport(handler),
+        )
+        await client.post("/v1/tickets", json={"subject": "test"})
+        await client.aclose()
+
+        self.assertEqual(len(captured), 1)
+        self.assertRegex(captured[0], r"^sdk:[0-9a-f-]{36}$")
 
 
 class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -820,6 +1080,44 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         session.wait_until_stopped.assert_awaited_once_with(9)
 
+    async def test_stop_requests_remote_teardown_before_local_cleanup(self):
+        events = []
+        http = MagicMock()
+
+        async def delete(*_args, **_kwargs):
+            events.append("remote")
+            return response(404, {"error": "session_not_found"}, "DELETE")
+
+        http.delete = AsyncMock(side_effect=delete)
+        session = session_for(http)
+
+        async def disconnect():
+            events.append("local")
+
+        session._disconnect = AsyncMock(side_effect=disconnect)
+        await session.stop(timeout=2)
+
+        self.assertEqual(events, ["remote", "local"])
+
+    async def test_device_browser_session_is_a_direct_async_context_manager(self):
+        ai = MagicMock()
+        device = Device(ai, {"device_id": "dev-1"})
+        entered = object()
+
+        class FakeSession:
+            async def __aenter__(self):
+                return entered
+
+            async def __aexit__(self, *_args):
+                return None
+
+        device.browser = AsyncMock(return_value=FakeSession())
+
+        async with device.browser_session(ttl="5m") as value:
+            self.assertIs(value, entered)
+
+        device.browser.assert_awaited_once_with(ttl="5m")
+
     async def test_invalid_footprint_tears_down_new_session(self):
         http = MagicMock()
         http.post = AsyncMock(
@@ -874,6 +1172,7 @@ class BrowserLifecycleTests(unittest.IsolatedAsyncioTestCase):
         http.post.assert_awaited_once_with(
             "/v1/devices/dev-1/browser",
             json={"footprint": "pixel-9"},
+            headers={},
         )
 
 

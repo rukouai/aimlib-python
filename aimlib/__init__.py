@@ -6,24 +6,63 @@ connection tokens are credentials; use them without printing or logging them.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from email.utils import parsedate_to_datetime
 import importlib
+import json
 import math
 import os
 import re
-from typing import Optional
+import uuid
+import warnings
+from typing import AsyncIterator, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 __all__ = [
-    "Aimlib", "Device", "Proxy", "BrowserSession", "Ticket",
-    "AimlibError", "BrowserPolicyError", "BrowserUnavailableError", "CapacityError",
-    "LeaseInactiveError", "DataCapError", "OperationTimeout", "SessionExpiredError", "SessionTimeout", "TabLimitError",
+    "Aimlib", "Device", "Proxy", "BrowserSession", "Ticket", "Operation",
+    "AimlibError", "AuthenticationError", "RateLimitError", "BadCarrierError",
+    "BrowserPolicyError", "BrowserUnavailableError", "BrowserAccessDeniedError",
+    "CapacityError", "LeaseInactiveError", "AccountInactiveError", "NoSessionError",
+    "FootprintNotCleanError", "OperationFailedError", "OperationTimeout",
+    "SessionExpiredError", "SessionNotFoundError", "SessionTimeout", "TabLimitError",
 ]
 
 
 class AimlibError(Exception):
-    pass
+    """Base SDK exception with stable service diagnostics.
+
+    ``code`` is safe for program logic. ``request_id`` can be sent to support. ``retry_after`` is
+    the server-provided delay in seconds when one was available.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        code: Optional[str] = None,
+        status_code: Optional[int] = None,
+        retry_after: Optional[float] = None,
+        request_id: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.request_id = request_id
+
+
+class AuthenticationError(AimlibError):
+    """The customer API key is missing, invalid, expired, or revoked."""
+
+
+class RateLimitError(AimlibError):
+    """The service asked the caller to retry after a bounded delay."""
+
+
+class BadCarrierError(AimlibError):
+    """The supplied carrier identifier is invalid."""
 
 
 class BrowserPolicyError(AimlibError):
@@ -38,11 +77,23 @@ class LeaseInactiveError(AimlibError):
     pass
 
 
-class DataCapError(AimlibError):
-    pass
+class AccountInactiveError(AimlibError):
+    """The customer account itself is suspended or closed."""
+
+
+class NoSessionError(AimlibError):
+    """The operation requires an active browser session."""
+
+
+class FootprintNotCleanError(AimlibError):
+    """The selected footprint is not in this device's clean catalog."""
 
 
 class SessionExpiredError(AimlibError):
+    pass
+
+
+class SessionNotFoundError(SessionExpiredError):
     pass
 
 
@@ -51,7 +102,15 @@ class SessionTimeout(AimlibError):
 
 
 class OperationTimeout(AimlibError):
-    pass
+    def __init__(self, message: str = "operation timed out", *, operation=None, **kwargs):
+        super().__init__(message, **kwargs)
+        self.operation = operation
+
+
+class OperationFailedError(AimlibError):
+    def __init__(self, message: str = "operation failed", *, operation=None, **kwargs):
+        super().__init__(message, **kwargs)
+        self.operation = operation
 
 
 class TabLimitError(AimlibError):
@@ -62,14 +121,26 @@ class BrowserUnavailableError(AimlibError):
     """The remote browser cannot currently be created or reached."""
 
 
+class BrowserAccessDeniedError(AimlibError):
+    """The browser connection token or session authorization was rejected."""
+
+
 _ERROR_BY_CODE = {
+    "unauthorized": AuthenticationError,
+    "authentication_error": AuthenticationError,
+    "rate_limited": RateLimitError,
+    "bad_carrier": BadCarrierError,
     "capacity_unavailable": CapacityError,
     "lease_inactive": LeaseInactiveError,
-    "data_cap_exceeded": DataCapError,
+    "account_inactive": AccountInactiveError,
+    "no_session": NoSessionError,
+    "footprint_not_clean": FootprintNotCleanError,
     "session_expired": SessionExpiredError,
+    "session_not_found": SessionNotFoundError,
     "session_provisioning": SessionTimeout,
     "browser_unavailable": BrowserUnavailableError,
     "device_unavailable": BrowserUnavailableError,
+    "browser_access_denied": BrowserAccessDeniedError,
 }
 
 
@@ -82,17 +153,119 @@ def _ttl_seconds(v) -> int:
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2) or "s"]
 
 
+def _retry_after_seconds(value) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            from datetime import datetime, timezone
+
+            return max(0.0, (parsedate_to_datetime(str(value)) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
 def _raise_for_typed(r: httpx.Response):
     if r.status_code < 400:
         return
-    code, msg = "", ""
+    code, msg, request_id, retry_after = "", "", None, None
     try:
         body = r.json()
         code = body.get("error", "")
         msg = body.get("message", code)
+        request_id = body.get("request_id")
+        retry_after = body.get("retry_after", body.get("retry_after_s"))
     except Exception:  # noqa: BLE001
         msg = r.text[:200]
-    raise _ERROR_BY_CODE.get(code, AimlibError)(msg or f"HTTP {r.status_code}")
+    request_id = request_id or r.headers.get("X-Request-ID")
+    retry_after = _retry_after_seconds(retry_after or r.headers.get("Retry-After"))
+    if code == "footprint_not_clean" and "list_footprints" not in msg:
+        msg = (msg or "the requested footprint is unavailable") + (
+            "; choose a slug returned by await device.list_footprints()"
+        )
+    error_type = _ERROR_BY_CODE.get(code)
+    if error_type is None and r.status_code == 401:
+        error_type = AuthenticationError
+    if error_type is None and r.status_code == 429:
+        error_type = RateLimitError
+    error_type = error_type or AimlibError
+    raise error_type(
+        msg or f"HTTP {r.status_code}",
+        code=code or None,
+        status_code=r.status_code,
+        retry_after=retry_after,
+        request_id=request_id,
+    )
+
+
+class _HTTPClient:
+    """Lazy async transport with bounded retries for idempotent reads."""
+
+    def __init__(self, *, base_url: str, api_key: str, timeout: float):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
+        self._client: Optional[httpx.AsyncClient] = None
+        self.closed = False
+
+    def _ensure(self) -> httpx.AsyncClient:
+        if self.closed:
+            raise AimlibError("the Aimlib client is closed")
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+        return self._client
+
+    async def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        method = method.upper()
+        headers = dict(kwargs.pop("headers", {}) or {})
+        if method == "POST" and not any(k.lower() == "idempotency-key" for k in headers):
+            headers["Idempotency-Key"] = f"sdk:{uuid.uuid4()}"
+        attempts = 3 if method == "GET" else 1
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                response = await self._ensure().request(method, url, headers=headers, **kwargs)
+            except httpx.TransportError as exc:
+                last_error = exc
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(0.25 * (2**attempt))
+                continue
+            if response.status_code not in {429, 502, 503, 504} or attempt + 1 >= attempts:
+                return response
+            delay = _retry_after_seconds(response.headers.get("Retry-After"))
+            await response.aclose()
+            await asyncio.sleep(min(delay if delay is not None else 0.25 * (2**attempt), 5.0))
+        raise last_error or AimlibError("request failed")
+
+    async def get(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("POST", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs) -> httpx.Response:
+        return await self.request("DELETE", url, **kwargs)
+
+    @asynccontextmanager
+    async def stream(self, method: str, url: str, **kwargs):
+        async with self._ensure().stream(method, url, **kwargs) as response:
+            yield response
+
+    async def aclose(self):
+        if self._client is not None:
+            await self._client.aclose()
+        self.closed = True
+
+
+def _idempotency_headers(key: Optional[str]) -> dict[str, str]:
+    return {"Idempotency-Key": key} if key else {}
 
 
 async def _reject_detectable_browser_binding(*_args, **_kwargs):
@@ -373,15 +546,26 @@ _VERIFY_MANAGED_BROWSER_IDENTITY = r"""async expected => {
   const headfulInsets = screen.availHeight < screen.height &&
     innerHeight < screen.availHeight &&
     visualViewport && visualViewport.height > 0 && visualViewport.height <= innerHeight + 1;
+  // Android's integer density quantization can expose one CSS pixel above the physical-pixel / DPR
+  // ceiling. Permit only that one-sided delta; larger or smaller display identities still fail.
+  const screenMetrics = screen.width >= expected.screenWidth &&
+    screen.width <= expected.screenWidth + 1 &&
+    screen.height >= expected.screenHeight &&
+    screen.height <= expected.screenHeight + 1;
   return high.model === expected.model &&
-    screen.width === expected.screenWidth &&
-    screen.height === expected.screenHeight &&
+    screenMetrics &&
     Math.abs(devicePixelRatio - expected.devicePixelRatio) < 0.001 &&
     headfulInsets;
 }"""
 
 
 class Proxy:
+    """A credentialed endpoint that accepts HTTP and SOCKS5 on one host and port.
+
+    URL attributes contain credentials and must not be logged. ``protocols`` is the authoritative
+    capability tuple; the scalar ``protocol`` property is deprecated compatibility metadata.
+    """
+
     def __init__(self, d: dict):
         self.id = d.get("id")
         self.url = d.get("url")
@@ -389,13 +573,22 @@ class Proxy:
         self.socks5_url = d.get("socks5_url") or self._with_scheme("socks5")
         self.socks5h_url = d.get("socks5h_url") or self._with_scheme("socks5h")
         self.protocols = tuple(d.get("protocols") or ("http", "socks5"))
-        # Kept for older callers. The endpoint itself auto-detects both protocols.
-        self.protocol = d.get("protocol")
+        self._protocol = d.get("protocol")
         self.status = d.get("status")
         self.status_detail = d.get("status_detail")
-        parsed = urlsplit(self.url or "")
+        parsed = urlsplit(self.url or self.http_url or self.socks5h_url or "")
         self.host = parsed.hostname
         self.port = parsed.port
+
+    @property
+    def protocol(self):
+        """Return legacy scalar protocol metadata; prefer :attr:`protocols`."""
+        warnings.warn(
+            "Proxy.protocol is deprecated; use Proxy.protocols and an explicit URL attribute",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._protocol
 
     def _with_scheme(self, scheme: str) -> Optional[str]:
         if not self.url:
@@ -403,47 +596,157 @@ class Proxy:
         parsed = urlsplit(self.url)
         return urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
 
+    def as_httpx(self, protocol: str = "http") -> dict:
+        """Return keyword arguments for ``httpx.Client`` or ``httpx.AsyncClient``."""
+        if protocol == "http":
+            url = self.http_url
+        elif protocol in {"socks5", "socks5h"}:
+            url = self.socks5h_url if protocol == "socks5h" else self.socks5_url
+        else:
+            raise ValueError("protocol must be http, socks5, or socks5h")
+        return {"proxy": url}
+
+    def as_requests(self, protocol: str = "http") -> dict:
+        """Return keyword arguments for ``requests.Session.request``.
+
+        SOCKS use requires ``requests[socks]`` (PySocks).
+        """
+        if protocol == "http":
+            proxies = {"http": self.http_url, "https": self.http_url}
+        elif protocol in {"socks5", "socks5h"}:
+            url = self.socks5h_url if protocol == "socks5h" else self.socks5_url
+            proxies = {"http": url, "https": url}
+        else:
+            raise ValueError("protocol must be http, socks5, or socks5h")
+        return {"proxies": proxies}
+
     def __repr__(self):
-        # Never put proxy credentials in a REPL/log merely because the object was printed.
         return (
             f"Proxy(host={self.host!r}, port={self.port!r}, "
             f"protocols={self.protocols!r}, status={self.status!r})"
         )
 
 
+class Operation(dict):
+    """A dict-compatible network-operation result with typed convenience properties."""
+
+    @property
+    def id(self) -> Optional[str]:
+        """Return the service operation identifier."""
+        return self.get("operation_id")
+
+    @property
+    def status(self) -> Optional[str]:
+        """Return the current queued, running, or terminal status."""
+        return self.get("status")
+
+    @property
+    def type(self) -> Optional[str]:
+        """Return the customer-facing operation type."""
+        return self.get("type")
+
+    @property
+    def terminal(self) -> bool:
+        """Report whether the operation has reached a terminal state."""
+        return self.status in {"succeeded", "failed", "timeout"}
+
+    @property
+    def succeeded(self) -> bool:
+        """Report whether the operation completed successfully."""
+        return self.status == "succeeded"
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __repr__(self):
+        return f"Operation(id={self.id!r}, type={self.type!r}, status={self.status!r})"
+
+
+def _raise_for_operation(operation: Operation):
+    if operation.status == "timeout":
+        raise OperationTimeout(
+            operation.get("message", "the operation did not complete before its timeout"),
+            operation=operation,
+            code=operation.get("error", "operation_timeout"),
+        )
+    if operation.status == "failed":
+        raise OperationFailedError(
+            operation.get("message", "the operation could not be completed"),
+            operation=operation,
+            code=operation.get("error", "operation_failed"),
+        )
+
+
 class Device:
+    """A device in the account's active rental inventory."""
+
     def __init__(self, ai: "Aimlib", d: dict):
         self._ai = ai
+        self._update(d)
+
+    def _update(self, d: dict):
         self.id = d["device_id"]
         self.region = d.get("region")
         self.carrier = d.get("carrier")
+        self.carriers = list(d.get("carriers") or [])
         self.current_egress_ip = d.get("current_egress_ip")
         self.proxy = Proxy(d["proxy"]) if d.get("proxy") else None
         browser = d.get("browser") or {}
         self.browser_available = browser.get("available")
         lease = d.get("lease") or {}
         self.lease_id = lease.get("id")
+        self.lease_starts_at = lease.get("starts_at")
         self.lease_ends_at = lease.get("ends_at")
+        self.lease_open_ended = bool(lease.get("open_ended", self.lease_ends_at is None))
+        return self
 
     def __repr__(self):
         return f"Device(id={self.id!r}, region={self.region!r}, carrier={self.carrier!r})"
 
-    async def list_footprints(self) -> list:
-        """Return footprint choices available for this device.
+    async def refresh(self) -> "Device":
+        """Refresh this object in place with one direct device lookup."""
+        r = await self._ai._http.get(f"/v1/devices/{self.id}")
+        _raise_for_typed(r)
+        return self._update(r.json())
 
-        Pass a returned slug to ``device.browser(footprint=...)`` or
-        ``session.set_footprint(...)``.
-        """
+    async def whoami(self) -> dict:
+        """Return the device's latest public egress IP, carrier, and observation time."""
+        r = await self._ai._http.get(f"/v1/devices/{self.id}/whoami")
+        _raise_for_typed(r)
+        data = r.json()
+        self.current_egress_ip = data.get("egress_ip") or self.current_egress_ip
+        self.carrier = data.get("carrier") or self.carrier
+        return data
+
+    async def egress_ip(self) -> Optional[str]:
+        """Return the latest observed public egress IP."""
+        return (await self.whoami()).get("egress_ip")
+
+    async def usage(self) -> dict:
+        """Return byte totals for this rental's accounting window (reporting only)."""
+        r = await self._ai._http.get(f"/v1/devices/{self.id}/usage")
+        _raise_for_typed(r)
+        return r.json()
+
+    async def list_footprints(self) -> list:
+        """Return clean footprint records; pass a record's ``slug`` to :meth:`browser`."""
         r = await self._ai._http.get(f"/v1/devices/{self.id}/footprints")
         _raise_for_typed(r)
         return r.json().get("footprints", [])
 
-    async def browser(self, footprint=None, ttl=None, idle_timeout=None, sticky=None) -> "BrowserSession":
-        """Start a managed-browser session.
-
-        ``footprint`` accepts a slug from :meth:`list_footprints`. The returned session is not
-        connected yet; ``async with await device.browser(...)`` connects and stops it automatically.
-        """
+    async def browser(
+        self,
+        footprint=None,
+        ttl=None,
+        idle_timeout=None,
+        sticky=None,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> "BrowserSession":
+        """Create a managed-browser session without connecting it yet."""
         body: dict = {}
         if ttl is not None:
             body["ttl"] = _ttl_seconds(ttl)
@@ -451,18 +754,25 @@ class Device:
             body["idle_timeout"] = _ttl_seconds(idle_timeout)
         if footprint is not None:
             body["footprint"] = footprint
-        # Retained only for call compatibility. Lease/session policy owns IP stickiness; the browser
-        # endpoint has never implemented this request field, so do not imply that it changes state.
-        _ = sticky
-        r = await self._ai._http.post(f"/v1/devices/{self.id}/browser", json=body)
+        if sticky is not None:
+            warnings.warn(
+                "sticky is deprecated and has no effect; rental lifecycle owns IP persistence",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        r = await self._ai._http.post(
+            f"/v1/devices/{self.id}/browser",
+            json=body,
+            headers=_idempotency_headers(idempotency_key),
+        )
         _raise_for_typed(r)
         session_data = r.json()
         sess = BrowserSession(self._ai, self, session_data)
         if footprint and session_data.get("desired_footprint") != footprint:
-            # Compatibility with servers predating atomic footprint selection. A current server
-            # validates and stores the footprint in the create transaction and echoes it above.
             try:
-                fr = await self._ai._http.post(f"/v1/devices/{self.id}/footprint", json={"footprint": footprint})
+                fr = await self._ai._http.post(
+                    f"/v1/devices/{self.id}/footprint", json={"footprint": footprint}
+                )
                 _raise_for_typed(fr)
                 sess.desired_footprint = footprint
             except BaseException as exc:
@@ -477,89 +787,137 @@ class Device:
             sess.desired_footprint = footprint
         return sess
 
-    async def rotate_ip(self, wait: bool = True, timeout: float = 240) -> dict:
-        """Request a new public IP for this device.
+    def browser_session(self, **kwargs):
+        """Return a direct async context manager: ``async with device.browser_session()``."""
+        return _BrowserSessionContext(self, kwargs)
 
-        Blocking mode returns a terminal operation dictionary and updates ``current_egress_ip``
-        when ``new_ip`` is present. With ``wait=False``, poll the returned ``operation_id`` through
-        ``ai.operations``. Leave at least 30 seconds between requests on one device.
-        """
-        body = {"wait": wait, "timeout_s": int(timeout)}
+    async def rotate_ip(
+        self,
+        wait: bool = True,
+        timeout=240,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Operation:
+        """Request a new IP; blocking failures raise ``OperationFailedError`` or timeout."""
+        timeout_s = _ttl_seconds(timeout)
         r = await self._ai._http.post(
-            f"/v1/devices/{self.id}/rotate-ip", json=body, timeout=timeout + 30
+            f"/v1/devices/{self.id}/rotate-ip",
+            json={"wait": wait, "timeout_s": timeout_s},
+            timeout=timeout_s + 30,
+            headers=_idempotency_headers(idempotency_key),
         )
         _raise_for_typed(r)
-        out = r.json()
+        out = Operation(r.json())
+        if wait:
+            _raise_for_operation(out)
         if out.get("new_ip"):
             self.current_egress_ip = out["new_ip"]
         return out
 
-    async def switch_carrier(self, carrier: str, wait: bool = True, timeout: float = 200) -> dict:
-        """Switch to an available carrier identifier.
-
-        Accepted identifiers are ``tmobile``, ``att``, and ``verizon``; availability is
-        device-specific. Blocking mode returns a terminal operation dictionary. With
-        ``wait=False``, poll the returned ``operation_id`` through ``ai.operations``.
-        """
-        body = {"carrier": carrier, "wait": wait, "timeout_s": int(timeout)}
+    async def switch_carrier(
+        self,
+        carrier: str,
+        wait: bool = True,
+        timeout=200,
+        *,
+        idempotency_key: Optional[str] = None,
+    ) -> Operation:
+        """Switch to a provisioned carrier; blocking failure results raise typed exceptions."""
+        timeout_s = _ttl_seconds(timeout)
         r = await self._ai._http.post(
-            f"/v1/devices/{self.id}/carrier", json=body, timeout=timeout + 30
+            f"/v1/devices/{self.id}/carrier",
+            json={"carrier": carrier, "wait": wait, "timeout_s": timeout_s},
+            timeout=timeout_s + 30,
+            headers=_idempotency_headers(idempotency_key),
         )
         _raise_for_typed(r)
-        out = r.json()
+        out = Operation(r.json())
+        if wait:
+            _raise_for_operation(out)
         if out.get("status") == "succeeded" and out.get("carrier"):
             self.carrier = out["carrier"]
         if out.get("new_ip"):
             self.current_egress_ip = out["new_ip"]
         return out
 
+    async def rotation_url(self, *, idempotency_key: Optional[str] = None) -> str:
+        """Mint a token-scoped rotation URL for this active rental."""
+        r = await self._ai._http.post(
+            f"/v1/devices/{self.id}/rotation-link",
+            headers=_idempotency_headers(idempotency_key),
+        )
+        _raise_for_typed(r)
+        return r.json()["url"]
+
+
+class _BrowserSessionContext:
+    def __init__(self, device: Device, kwargs: dict):
+        self.device = device
+        self.kwargs = kwargs
+        self.session: Optional[BrowserSession] = None
+
+    async def __aenter__(self):
+        self.session = await self.device.browser(**self.kwargs)
+        return await self.session.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        if self.session is not None:
+            return await self.session.__aexit__(exc_type, exc, traceback)
+        return None
+
 
 class _Devices:
     def __init__(self, ai: "Aimlib"):
         self._ai = ai
 
-    async def list(self):
-        r = await self._ai._http.get("/v1/devices")
+    async def list(self, *, region=None, carrier=None, browser=None) -> list[Device]:
+        """List active-rental devices, optionally filtered by region, carrier, or browser support."""
+        params = {
+            key: value
+            for key, value in {"region": region, "carrier": carrier, "browser": browser}.items()
+            if value is not None
+        }
+        kwargs = {"params": params} if params else {}
+        r = await self._ai._http.get("/v1/devices", **kwargs)
         _raise_for_typed(r)
         return [Device(self._ai, d) for d in r.json()]
 
     async def get(self, device_id: str) -> Device:
-        for d in await self.list():
-            if d.id == device_id:
-                return d
-        raise AimlibError(f"device {device_id} not leased to this account")
+        """Fetch one active-rental device directly."""
+        r = await self._ai._http.get(f"/v1/devices/{device_id}")
+        _raise_for_typed(r)
+        return Device(self._ai, r.json())
 
 
 class _Operations:
     def __init__(self, ai: "Aimlib"):
         self._ai = ai
 
-    async def get(self, operation_id: str) -> dict:
-        """Fetch a queued IP-rotation or carrier-switch operation owned by this account."""
+    async def get(self, operation_id: str) -> Operation:
+        """Fetch a customer-owned IP-rotation or carrier-switch operation."""
         r = await self._ai._http.get(f"/v1/operations/{operation_id}")
         _raise_for_typed(r)
-        return r.json()
+        return Operation(r.json())
 
-    async def wait(
-        self,
-        operation_id: str,
-        timeout: float = 300,
-        poll_interval: float = 1.5,
-    ) -> dict:
-        """Poll an operation until it succeeds, fails, or reaches its server timeout."""
+    async def wait(self, operation_id: str, timeout=300, poll_interval=1.5) -> Operation:
+        """Poll an operation until terminal; polling duration accepts seconds or ``5m`` syntax."""
+        timeout_s = _ttl_seconds(timeout)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout_s
         while True:
             operation = await self.get(operation_id)
-            if operation.get("status") in {"succeeded", "failed", "timeout"}:
+            if operation.terminal:
+                _raise_for_operation(operation)
                 return operation
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise OperationTimeout("operation polling timed out")
+                raise OperationTimeout("operation polling timed out", operation=operation)
             await asyncio.sleep(min(poll_interval, remaining))
 
 
 class BrowserSession:
+    """One managed browser session bound to the leased device."""
+
     def __init__(self, ai: "Aimlib", device: Device, data: dict):
         self._ai = ai
         self.device = device
@@ -582,9 +940,11 @@ class BrowserSession:
         self._identity_pages: set[int] = set()
         self._native_browser_identity = None
 
-    async def wait_until_ready(self, timeout: float = 180):
+    async def wait_until_ready(self, timeout=180):
+        """Wait for this exact remote session to become driveable."""
+        timeout_s = _ttl_seconds(timeout)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout_s
         while loop.time() < deadline:
             r = await self._ai._http.get(f"/v1/devices/{self.device.id}/browser")
             if r.status_code == 404:
@@ -608,9 +968,9 @@ class BrowserSession:
             if self.status == "failed":
                 raise AimlibError("session failed")
             await asyncio.sleep(2)
-        raise SessionTimeout(f"session not ready within {timeout}s")
+        raise SessionTimeout(f"session not ready within {timeout_s}s")
 
-    async def connect(self, timeout: float = 180):
+    async def connect(self, timeout=180):
         """Wait until ready and connect the supported async browser client.
 
         Transient connection failures are retried against the same remote session. Failed local
@@ -624,9 +984,10 @@ class BrowserSession:
                 pass
             await self._disconnect()
 
+        timeout_s = _ttl_seconds(timeout)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        await self.wait_until_ready(timeout)
+        deadline = loop.time() + timeout_s
+        await self.wait_until_ready(timeout_s)
         # The browser client expects the HTTP form of the returned connection endpoint.
         disco = self.connect_url.replace("wss://", "https://").replace("ws://", "http://")
         last_error: Exception | None = None
@@ -676,23 +1037,34 @@ class BrowserSession:
             ) from last_error
         failure_code = _browser_connect_failure_code(last_error) if last_error else "deadline_exhausted"
         raise SessionTimeout(
-            f"remote browser did not become reachable within {timeout}s after {attempts} attempts "
+            f"remote browser did not become reachable within {timeout_s}s after {attempts} attempts "
             f"({failure_code})"
         ) from last_error
 
-    async def set_footprint(self, footprint: Optional[str], timeout: float = 120):
+    async def set_footprint(
+        self,
+        footprint: Optional[str],
+        timeout=120,
+        *,
+        idempotency_key: Optional[str] = None,
+    ):
         """Apply an available footprint and reconnect this session.
 
         Pass ``None`` or an empty string to restore the device default. Select non-empty values from
         ``device.list_footprints()``.
         """
         fp = footprint or ""
-        r = await self._ai._http.post(f"/v1/devices/{self.device.id}/footprint", json={"footprint": fp})
+        timeout_s = _ttl_seconds(timeout)
+        r = await self._ai._http.post(
+            f"/v1/devices/{self.device.id}/footprint",
+            json={"footprint": fp},
+            headers=_idempotency_headers(idempotency_key),
+        )
         _raise_for_typed(r)
         self.desired_footprint = fp
         await self._disconnect()  # Applying a footprint invalidates the existing connection.
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout_s
         while loop.time() < deadline:
             r = await self._ai._http.get(f"/v1/devices/{self.device.id}/browser")
             if r.status_code == 404:
@@ -706,10 +1078,10 @@ class BrowserSession:
             self.fingerprint = data.get("resolved_profile") or {}
             if self.applied_footprint == fp and self.status in ("ready", "active", "idle"):
                 _validated_footprint_identity(self.fingerprint, self.applied_footprint)
-                await self.connect(timeout=timeout)  # transparent reconnect to the same session_id
+                await self.connect(timeout=timeout_s)  # transparent reconnect to the same session_id
                 return
             await asyncio.sleep(2)
-        raise SessionTimeout(f"footprint {fp!r} not applied within {timeout}s")
+        raise SessionTimeout(f"footprint {fp!r} not applied within {timeout_s}s")
 
     async def _disconnect(self):
         for cdp_session in reversed(self._identity_cdp_sessions):
@@ -871,10 +1243,11 @@ class BrowserSession:
         await self._apply_page_identity(page)
         return page
 
-    async def wait_until_stopped(self, timeout: float = 120):
+    async def wait_until_stopped(self, timeout=120):
         """Wait until the service confirms this session is no longer live."""
+        timeout_s = _ttl_seconds(timeout)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = loop.time() + timeout_s
         while loop.time() < deadline:
             r = await self._ai._http.get(f"/v1/devices/{self.device.id}/browser")
             if r.status_code == 404:
@@ -887,22 +1260,63 @@ class BrowserSession:
                 return
             self.status = data.get("status") or self.status
             await asyncio.sleep(2)
-        raise SessionTimeout(f"session teardown not confirmed within {timeout}s")
+        raise SessionTimeout(f"session teardown not confirmed within {timeout_s}s")
 
-    async def stop(self, wait: bool = True, timeout: float = 120):
-        """Stop the session and optionally wait until it is no longer active."""
-        await self._disconnect()
+    async def stop(self, wait: bool = True, timeout=120):
+        """Stop the remote session within one shared deadline, including local cleanup."""
+        timeout_s = _ttl_seconds(timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        response = None
+        request_error = None
         try:
-            r = await self._ai._http.delete(f"/v1/devices/{self.device.id}/browser")
+            response = await asyncio.wait_for(
+                self._ai._http.delete(
+                    f"/v1/devices/{self.device.id}/browser",
+                    timeout=max(0.1, deadline - loop.time()),
+                ),
+                timeout=max(0.1, deadline - loop.time()),
+            )
         except Exception as exc:  # noqa: BLE001
-            raise AimlibError("could not request browser teardown") from exc
-        if r.status_code == 404:
+            request_error = exc
+        try:
+            await asyncio.wait_for(
+                self._disconnect(),
+                timeout=max(0.1, deadline - loop.time()),
+            )
+        except asyncio.TimeoutError as exc:
+            raise SessionTimeout(
+                f"local browser cleanup exceeded the {timeout_s}s stop deadline"
+            ) from exc
+        if request_error is not None:
+            raise AimlibError("could not request browser teardown") from request_error
+        if response.status_code == 404:
             self.status = "gone"
             return
-        _raise_for_typed(r)
+        _raise_for_typed(response)
         self.status = "expiring"
         if wait:
-            await self.wait_until_stopped(timeout)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise SessionTimeout(f"session teardown not confirmed within {timeout_s}s")
+            try:
+                await asyncio.wait_for(
+                    self.wait_until_stopped(max(1, math.ceil(remaining))),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                raise SessionTimeout(
+                    f"session teardown not confirmed within {timeout_s}s"
+                ) from exc
+
+    def __del__(self):
+        if self.browser is None and self._pw is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._disconnect())
 
     async def __aenter__(self):
         try:
@@ -955,13 +1369,16 @@ class Ticket:
 
     @property
     def complete(self) -> bool:
+        """Report whether both customer and operator have closed the ticket."""
         return self.status == "closed"
 
-    async def reply(self, body: str) -> "Ticket":
-        return await self._ai.tickets.reply(self.id, body)
+    async def reply(self, body: str, *, idempotency_key: Optional[str] = None) -> "Ticket":
+        """Post a customer reply and return the refreshed ticket."""
+        return await self._ai.tickets.reply(self.id, body, idempotency_key=idempotency_key)
 
-    async def close(self) -> "Ticket":
-        return await self._ai.tickets.close(self.id)
+    async def close(self, *, idempotency_key: Optional[str] = None) -> "Ticket":
+        """Request customer-side closure and return the refreshed ticket."""
+        return await self._ai.tickets.close(self.id, idempotency_key=idempotency_key)
 
     def __repr__(self):
         return f"Ticket(id={self.id!r}, subject={self.subject!r}, status={self.status!r})"
@@ -971,13 +1388,20 @@ class _Tickets:
     def __init__(self, ai: "Aimlib"):
         self._ai = ai
 
-    async def create(self, subject: str, body: str) -> Ticket:
+    async def create(
+        self, subject: str, body: str, *, idempotency_key: Optional[str] = None
+    ) -> Ticket:
         """File a new support ticket (subject + first message)."""
-        r = await self._ai._http.post("/v1/tickets", json={"subject": subject, "body": body})
+        r = await self._ai._http.post(
+            "/v1/tickets",
+            json={"subject": subject, "body": body},
+            headers=_idempotency_headers(idempotency_key),
+        )
         _raise_for_typed(r)
         return Ticket(self._ai, r.json())
 
     async def list(self) -> "list[Ticket]":
+        """List tickets visible to the authenticated customer."""
         r = await self._ai._http.get("/v1/tickets")
         _raise_for_typed(r)
         return [Ticket(self._ai, d) for d in r.json()]
@@ -988,38 +1412,90 @@ class _Tickets:
         _raise_for_typed(r)
         return Ticket(self._ai, r.json())
 
-    async def reply(self, ticket_id: str, body: str) -> Ticket:
+    async def reply(
+        self, ticket_id: str, body: str, *, idempotency_key: Optional[str] = None
+    ) -> Ticket:
         """Post a message on a ticket (reopens it if it was closed)."""
-        r = await self._ai._http.post(f"/v1/tickets/{ticket_id}/messages", json={"body": body})
+        r = await self._ai._http.post(
+            f"/v1/tickets/{ticket_id}/messages",
+            json={"body": body},
+            headers=_idempotency_headers(idempotency_key),
+        )
         _raise_for_typed(r)
         return Ticket(self._ai, r.json())
 
-    async def close(self, ticket_id: str) -> Ticket:
+    async def close(
+        self, ticket_id: str, *, idempotency_key: Optional[str] = None
+    ) -> Ticket:
         """Mark the ticket closed from your side. It's only complete once the operator closes too."""
-        r = await self._ai._http.post(f"/v1/tickets/{ticket_id}/close")
+        r = await self._ai._http.post(
+            f"/v1/tickets/{ticket_id}/close",
+            headers=_idempotency_headers(idempotency_key),
+        )
         _raise_for_typed(r)
         return Ticket(self._ai, r.json())
 
 
 class Aimlib:
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, timeout: float = 60):
+    """Authenticated async client for the regional aimlib customer API."""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 60,
+    ):
         self.api_key = api_key or os.environ.get("AIMLIB_API_KEY")
         if not self.api_key:
-            raise AimlibError("no API key (pass api_key= or set AIMLIB_API_KEY)")
+            raise AuthenticationError("no API key (pass api_key= or set AIMLIB_API_KEY)")
         # Use the regional customer API URL assigned to the account unless explicitly overridden.
-        self.base_url = (base_url or os.environ.get("AIMLIB_BASE_URL", "https://uswest1.aimlib.com")).rstrip("/")
-        self._http = httpx.AsyncClient(
-            base_url=self.base_url, timeout=timeout,
-            headers={"Authorization": f"Bearer {self.api_key}"},
-        )
+        self.base_url = (base_url or os.environ.get("AIMLIB_BASE_URL", "https://uswest.aimlib.com")).rstrip("/")
+        self._http = _HTTPClient(base_url=self.base_url, api_key=self.api_key, timeout=timeout)
         self.devices = _Devices(self)
         self.operations = _Operations(self)
         self.tickets = _Tickets(self)
 
     async def device(self, device_id: str) -> Device:
+        """Compatibility alias for ``devices.get(device_id)``."""
         return await self.devices.get(device_id)
 
+    async def usage(self, device_id: Optional[str] = None) -> dict:
+        """Return account usage totals, or one device's active-rental totals."""
+        path = f"/v1/devices/{device_id}/usage" if device_id else "/v1/usage"
+        r = await self._http.get(path)
+        _raise_for_typed(r)
+        return r.json()
+
+    async def events(self) -> AsyncIterator[dict]:
+        """Yield authenticated operation and lease lifecycle events from the SSE feed.
+
+        The service intentionally ends streams periodically. This iterator reconnects until it is
+        closed or the surrounding task is cancelled. Delivery is at-least-once.
+        """
+        while True:
+            async with self._http.stream("GET", "/v1/events") as response:
+                _raise_for_typed(response)
+                event_name = "message"
+                data_lines = []
+                async for line in response.aiter_lines():
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    elif line == "":
+                        if data_lines:
+                            raw = "\n".join(data_lines)
+                            try:
+                                payload = json.loads(raw)
+                            except json.JSONDecodeError:
+                                payload = raw
+                            yield {"event": event_name, "data": payload}
+                        event_name = "message"
+                        data_lines = []
+            await asyncio.sleep(1)
+
     async def aclose(self):
+        """Close the underlying HTTP transport. Safe to call more than once."""
         await self._http.aclose()
 
     async def __aenter__(self):
@@ -1027,3 +1503,13 @@ class Aimlib:
 
     async def __aexit__(self, *exc):
         await self.aclose()
+
+    def __del__(self):
+        transport = getattr(self, "_http", None)
+        if transport is None or transport.closed or transport._client is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(transport.aclose())

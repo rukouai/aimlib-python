@@ -25,16 +25,16 @@ SKIP_PARTS = {
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml"}
 EXPECTED_FILES = {
     ".github/dependabot.yml",
-    ".github/workflows/ci.yml",
-    ".github/workflows/release.yml",
     ".gitignore",
     "aimlib/__init__.py",
+    "aimlib/cli.py",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "pyproject.toml",
     "README.md",
     "SECURITY.md",
+    "examples/quickstart.py",
     "tests/test_sdk.py",
 }
 README_HEADINGS = {
@@ -121,7 +121,7 @@ ALLOWED_HOSTS = {
     "github.com",
     "img.shields.io",
     "pypi.org",
-    "uswest1.aimlib.com",
+    "uswest.aimlib.com",
 }
 ALLOWED_TEST_NETWORKS = tuple(
     ipaddress.ip_network(cidr)
